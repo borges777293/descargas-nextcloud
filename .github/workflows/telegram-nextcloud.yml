@@ -56,7 +56,7 @@ jobs:
           if invalid:
               raise SystemExit("Solo se admiten enlaces de fuckingfast.co en esta primera versión")
           with open("links.txt", "w", encoding="utf-8") as f:
-              f.write("\\n".join(urls) + "\\n")
+              f.write("\n".join(urls) + "\n")
           print(f"Enlaces aceptados: {len(urls)}")
           PY
 
@@ -110,7 +110,7 @@ jobs:
 
           print(f"Archivos subidos: {uploaded}/{len(files)}")
           if errors:
-              print("\\n".join(errors))
+              print("\n".join(errors))
               raise SystemExit(1)
           PY
 
