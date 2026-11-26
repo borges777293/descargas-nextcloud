@@ -7,6 +7,8 @@ on:
         description: "Uno o varios enlaces de fuckingfast.co (uno por línea)"
         required: true
         type: string
+  repository_dispatch:
+    types: [telegram_download]
 
 permissions:
   contents: read
@@ -36,7 +38,7 @@ jobs:
 
       - name: Prepare link list
         env:
-          URLS: ${{ inputs.urls }}
+          URLS: ${{ github.event.inputs.urls || github.event.client_payload.urls || github.event.client_payload.url }}
         run: |
           python - <<'PY'
           import os
