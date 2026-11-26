@@ -1,3 +1,4 @@
+
 name: Telegram to Nextcloud
 
 on:
@@ -5,6 +6,10 @@ on:
     inputs:
       urls:
         description: "Uno o varios enlaces de fuckingfast.co (uno por línea)"
+        required: true
+        type: string
+      telegram_message_id:
+        description: "ID del mensaje de Telegram que se actualizará"
         required: true
         type: string
   repository_dispatch:
@@ -21,6 +26,7 @@ jobs:
   download-and-upload:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -33,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt -c constraints.txt
 
-      - name: Install Chromium for the provider's Turnstile fallback
+      - name: Install Chromium
         run: python -m playwright install --with-deps chromium
 
       - name: Prepare link list
@@ -46,25 +52,148 @@ jobs:
 
           raw = os.environ["URLS"]
           urls = [line.strip() for line in raw.splitlines() if line.strip()]
+
           if not urls:
               raise SystemExit("No se recibieron enlaces")
+
           invalid = []
           for url in urls:
               host = (urlparse(url).hostname or "").lower()
               if host not in {"fuckingfast.co", "www.fuckingfast.co"}:
                   invalid.append(url)
+
           if invalid:
-              raise SystemExit("Solo se admiten enlaces de fuckingfast.co en esta primera versión")
+              raise SystemExit("Solo se admiten enlaces de fuckingfast.co")
+
           with open("links.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(urls) + "\n")
+
           print(f"Enlaces aceptados: {len(urls)}")
           PY
 
       - name: Download with MoonDownloader
         id: download
         continue-on-error: true
+        env:
+          TELEGRAM_PROGRESS_JSON: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_ID: ${{ github.event.inputs.telegram_message_id || github.event.client_payload.telegram_message_id }}
         run: |
-          python moon_cli.py --urls links.txt --output downloads --extractors 2 --streams 4 --retries 2
+          python -u - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from urllib.request import Request, urlopen
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          message_id = os.environ.get("TELEGRAM_MESSAGE_ID", "")
+
+          def update_telegram(text):
+              if not token or not chat_id or not message_id:
+                  return
+              try:
+                  url = f"https://api.telegram.org/bot{token}/editMessageText"
+                  data = json.dumps({
+                      "chat_id": chat_id,
+                      "message_id": int(message_id),
+                      "text": text
+                  }).encode()
+                  req = Request(
+                      url,
+                      data=data,
+                      headers={"Content-Type": "application/json"}
+                  )
+                  with urlopen(req, timeout=20) as response:
+                      response.read()
+              except Exception as exc:
+                  print(f"[Telegram] No se pudo actualizar el mensaje: {exc}")
+
+          def format_progress(data):
+              stage = data.get("stage")
+
+              if stage == "extracting":
+                  done = data.get("extract_done", 0)
+                  total = data.get("extract_total", 0)
+                  return (
+                      "🔎 Extrayendo enlaces\n"
+                      f"Enlaces procesados: {done} de {total}\n"
+                      "Preparando las descargas..."
+                  )
+
+              active = data.get("active_files", [])
+
+              if active:
+                  lines = ["⬇️ DESCARGANDO"]
+                  for item in active:
+                      lines.append("")
+                      lines.append(
+                          f"Archivo {item.get('number', '?')} de "
+                          f"{item.get('total', '?')}: {item.get('name', 'Archivo')}"
+                      )
+
+                      percent = item.get("percent")
+                      if percent is None:
+                          lines.append("Progreso del archivo: calculando...")
+                      else:
+                          lines.append(f"Progreso del archivo: {percent}%")
+
+                      speed = float(item.get("speed_mbs", 0))
+                      if speed >= 1:
+                          speed_text = f"{speed:.1f} MB/s"
+                      else:
+                          speed_text = f"{speed * 1024:.0f} KB/s"
+
+                      lines.append(f"Velocidad: {speed_text}")
+
+                  return "\n".join(lines)
+
+              done = data.get("download_done", 0)
+              total = data.get("download_total", 0)
+              return (
+                  "⬇️ Descargando archivos\n"
+                  f"Descargas completadas: {done} de {total}\n"
+                  "Preparando el siguiente archivo..."
+              )
+
+          update_telegram("🔎 Extrayendo enlaces y preparando las descargas...")
+
+          command = [
+              sys.executable, "moon_cli.py",
+              "--urls", "links.txt",
+              "--output", "downloads",
+              "--extractors", "2",
+              "--streams", "4",
+              "--retries", "2"
+          ]
+
+          process = subprocess.Popen(
+              command,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+              bufsize=1,
+              env=os.environ.copy()
+          )
+
+          for line in process.stdout:
+              print(line, end="", flush=True)
+
+              marker = "TELEGRAM_PROGRESS:"
+              if marker in line:
+                  raw = line.split(marker, 1)[1].strip()
+                  try:
+                      progress = json.loads(raw)
+                      update_telegram(format_progress(progress))
+                  except Exception as exc:
+                      print(f"[Telegram] Error leyendo progreso: {exc}")
+
+          return_code = process.wait()
+          print(f"MoonDownloader terminó con código: {return_code}")
+          sys.exit(return_code)
+          PY
 
       - name: Upload completed files to Nextcloud
         id: upload
@@ -73,52 +202,114 @@ jobs:
           NEXTCLOUD_URL: ${{ secrets.NEXTCLOUD_URL }}
           NEXTCLOUD_USERNAME: ${{ secrets.NEXTCLOUD_USERNAME }}
           NEXTCLOUD_APP_PASSWORD: ${{ secrets.NEXTCLOUD_APP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_ID: ${{ github.event.inputs.telegram_message_id || github.event.client_payload.telegram_message_id }}
         run: |
           python - <<'PY'
           import os
+          import json
           import base64
           from pathlib import Path
           from urllib.parse import quote
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError, URLError
 
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          message_id = os.environ.get("TELEGRAM_MESSAGE_ID", "")
+
+          def update_telegram(text):
+              if not token or not chat_id or not message_id:
+                  return
+              try:
+                  url = f"https://api.telegram.org/bot{token}/editMessageText"
+                  data = json.dumps({
+                      "chat_id": chat_id,
+                      "message_id": int(message_id),
+                      "text": text
+                  }).encode()
+                  req = Request(
+                      url,
+                      data=data,
+                      headers={"Content-Type": "application/json"}
+                  )
+                  with urlopen(req, timeout=20) as response:
+                      response.read()
+              except Exception as exc:
+                  print(f"[Telegram] No se pudo actualizar el mensaje: {exc}")
+
           base = os.environ["NEXTCLOUD_URL"].rstrip("/") + "/"
           username = os.environ["NEXTCLOUD_USERNAME"]
           password = os.environ["NEXTCLOUD_APP_PASSWORD"]
-          files = [p for p in Path("downloads").rglob("*") if p.is_file()]
+
+          files = sorted(
+              p for p in Path("downloads").rglob("*") if p.is_file()
+          )
+
           if not files:
               print("No hay archivos descargados para subir.")
               raise SystemExit(0)
 
-          auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+          auth = base64.b64encode(
+              f"{username}:{password}".encode()
+          ).decode()
+
           uploaded = 0
           errors = []
-          for path in files:
+
+          for index, path in enumerate(files, start=1):
+              update_telegram(
+                  "☁️ SUBIENDO A NEXTCLOUD\n\n"
+                  f"Archivo {index} de {len(files)}:\n"
+                  f"{path.name}\n\n"
+                  "Preparando la subida..."
+              )
+
               target = base + quote(path.name, safe="")
-              request = Request(target, data=path.read_bytes(), method="PUT")
+              request = Request(
+                  target,
+                  data=path.read_bytes(),
+                  method="PUT"
+              )
               request.add_header("Authorization", "Basic " + auth)
-              request.add_header("Content-Type", "application/octet-stream")
+              request.add_header(
+                  "Content-Type", "application/octet-stream"
+              )
+
               try:
                   with urlopen(request, timeout=300) as response:
                       if response.status in (200, 201, 204):
                           uploaded += 1
                           print(f"Subido: {path.name}")
+
+                          update_telegram(
+                              "☁️ SUBIENDO A NEXTCLOUD\n\n"
+                              f"Archivo {index} de {len(files)}:\n"
+                              f"{path.name}\n\n"
+                              f"Archivos subidos: {uploaded} de {len(files)}"
+                          )
                       else:
-                          errors.append(f"{path.name}: HTTP {response.status}")
+                          errors.append(
+                              f"{path.name}: HTTP {response.status}"
+                          )
+
               except (HTTPError, URLError, TimeoutError) as exc:
                   errors.append(f"{path.name}: {exc}")
 
           print(f"Archivos subidos: {uploaded}/{len(files)}")
+
           if errors:
               print("\n".join(errors))
               raise SystemExit(1)
           PY
 
-      - name: Send Telegram result
+      - name: Update final Telegram message
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_ID: ${{ github.event.inputs.telegram_message_id || github.event.client_payload.telegram_message_id }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
         run: |
@@ -129,22 +320,51 @@ jobs:
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-          if not token or not chat_id:
-              print("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID; se omite el aviso.")
+          message_id = os.environ.get("TELEGRAM_MESSAGE_ID", "")
+
+          if not token or not chat_id or not message_id:
+              print("No hay datos suficientes para actualizar Telegram.")
               raise SystemExit(0)
 
           download = os.environ.get("DOWNLOAD_OUTCOME", "unknown")
           upload = os.environ.get("UPLOAD_OUTCOME", "unknown")
-          if download == "success" and upload in ("success", "skipped"):
-              message = "✅ Proceso terminado. Descarga correcta; revisa Nextcloud."
-          elif download == "success":
-              message = "⚠️ Descarga terminada, pero la subida a Nextcloud no se completó correctamente."
-          else:
-              message = "❌ El proceso de descarga terminó con errores. Revisa el registro de GitHub Actions."
 
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          data = json.dumps({"chat_id": chat_id, "text": message}).encode()
-          req = Request(url, data=data, headers={"Content-Type": "application/json"})
+          if download == "success" and upload == "success":
+              message = (
+                  "✅ PROCESO TERMINADO\n\n"
+                  "Descargas completadas y archivos subidos correctamente "
+                  "a Nextcloud."
+              )
+          elif download == "success" and upload == "skipped":
+              message = (
+                  "⚠️ Descarga terminada, pero no se encontraron archivos "
+                  "para subir a Nextcloud."
+              )
+          elif download == "success":
+              message = (
+                  "⚠️ Descarga terminada, pero hubo un problema al subir "
+                  "los archivos a Nextcloud."
+              )
+          else:
+              message = (
+                  "❌ PROCESO TERMINADO CON ERRORES\n\n"
+                  "La descarga no pudo completarse correctamente. "
+                  "Revisa el registro de GitHub Actions."
+              )
+
+          url = f"https://api.telegram.org/bot{token}/editMessageText"
+          data = json.dumps({
+              "chat_id": chat_id,
+              "message_id": int(message_id),
+              "text": message
+          }).encode()
+
+          req = Request(
+              url,
+              data=data,
+              headers={"Content-Type": "application/json"}
+          )
+
           with urlopen(req, timeout=30) as response:
-              print("Aviso Telegram:", response.status)
+              print("Mensaje de Telegram actualizado:", response.status)
           PY
