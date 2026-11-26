@@ -7,7 +7,7 @@ Usage:
     python moon_cli.py --urls links.txt --output /path/to/downloads
     python moon_cli.py --urls links.txt --output ./dl --browsers 8 --streams 24 --retries 3
 """
-import os, sys, asyncio, argparse
+import os, sys, asyncio, argparse, json
 import time, traceback
 from urllib.parse import urlparse, unquote
 
@@ -72,11 +72,39 @@ def _progress_line(snapshot: dict, total: int) -> str:
 
 def _progress_key(snapshot: dict) -> tuple:
     metrics = snapshot["metrics"]
+    file_state = tuple(
+        (row["key"], row["state"], row["pct"], row["mbs"])
+        for row in snapshot.get("files", [])
+    )
     return (
         metrics["stage"], metrics["extract_done"], metrics["extract_total"],
         metrics["dl_done"], metrics["dl_total"], metrics["active"],
         metrics["speed_mbs"], metrics["bytes_total"], metrics["ok"], metrics["fail"],
+        file_state,
     )
+
+def _telegram_progress_payload(snapshot: dict, url_positions: dict, total: int) -> dict:
+    metrics = snapshot["metrics"]
+    active_files = []
+    for row in snapshot.get("files", []):
+        if row.get("state") != "download":
+            continue
+        active_files.append({
+            "number": url_positions.get(row.get("key"), 0),
+            "total": total,
+            "name": row.get("name") or "Archivo sin nombre",
+            "percent": round(row["pct"] * 100) if row.get("pct") is not None else None,
+            "speed_mbs": row.get("mbs", 0.0),
+        })
+    return {
+        "stage": metrics["stage"],
+        "extract_done": metrics["extract_done"],
+        "extract_total": metrics["extract_total"],
+        "download_done": metrics["dl_done"],
+        "download_total": metrics["dl_total"],
+        "speed_mbs": metrics["speed_mbs"],
+        "active_files": active_files,
+    }
 
 async def run(urls: list[str], output_dir: str, n_workers: int,
               max_dl: int, max_retries: int, proxy_path: str, is_default_proxies: bool = False):
@@ -103,11 +131,14 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
            "total_links": len(urls)}
     telem = Telemetry(cfg, flavor="cli")
 
+    url_positions = {url: index for index, url in enumerate(urls, start=1)}
+
     for url in urls:
         p = urlparse(url)
         raw_name = unquote(p.fragment or p.path.split("/")[-1]) or url
         filename = _sanitize_filename(raw_name)
         rec = telem.reg(url, filename)
+        progress._track(rec)
         if rec.filename != filename:
             print(f"  [rename] {filename} -> {rec.filename} (filename collision)")
         await q.put((url, 1, rec))
@@ -129,6 +160,9 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
             if key != last_progress_key:
                 line = _progress_line(snapshot, len(urls))
                 print(line, flush=True)
+                if os.environ.get("TELEGRAM_PROGRESS_JSON") == "1":
+                    payload = _telegram_progress_payload(snapshot, url_positions, len(urls))
+                    print("TELEGRAM_PROGRESS:" + json.dumps(payload, ensure_ascii=False), flush=True)
                 last_progress_key = key
 
     # Kept in a local: a task with no reference can be collected mid-run.
@@ -140,6 +174,8 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
                 rec.status = "aborted"
                 return
             progress.mark_download_start()
+            rec.status = "downloading"
+            progress._track(rec)
             finalized = False
             try:
                 dest = os.path.join(output_dir, filename)
@@ -200,6 +236,8 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
                 break
 
             rec.worker_id = wid
+            rec.status = "extracting"
+            progress._track(rec)
             t_start = time.monotonic()
             rec.queue_wait_s = t_start - rec.queued_at
             filename = rec.filename
